@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+
+cat <<EOF | kubectl apply --server-side -f -
+apiVersion: cilium.io/v2alpha1
+kind: CiliumNodeConfig
+metadata:
+  namespace: kube-system
+  name: cilium-default
+spec:
+  nodeSelector:
+    matchLabels:
+      io.cilium.migration/cilium-default: "true"
+  defaults:
+    write-cni-conf-when-ready: /host/etc/cni/net.d/05-cilium.conflist
+    custom-cni-conf: "false"
+    cni-chaining-mode: "none"
+    cni-exclusive: "true"
+EOF
