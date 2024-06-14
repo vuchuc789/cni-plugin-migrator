@@ -1,6 +1,6 @@
 cluster:
   name: teko-test1
-  id: 101
+  id: 0
 operator:
   unmanagedPodWatcher:
     restart: false # Migration: Don't restart unmigrated pods
@@ -13,7 +13,7 @@ cni:
 ipam:
   mode: "cluster-pool"
   operator:
-    clusterPoolIPv4PodCIDRList: ["10.245.0.0/16"] # Migration: Ensure this is distinct and unused
+    clusterPoolIPv4PodCIDRList: ["10.123.0.0/16"] # Migration: Ensure this is distinct and unused
 policyEnforcementMode: "never" # Migration: Disable policy enforcement
 bpf:
   hostLegacyRouting: true # Migration: Allow for routing between Cilium and the existing overlay
