@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 )
+
+const IP_PREFIX = "10.123."
 
 func main() {
 	var (
@@ -65,11 +68,7 @@ func main() {
 	nodes = append(nodes, etcdNodes...)
 	nodes = append(nodes, workerNodes...)
 
-	for i, node := range nodes {
-		if i >= 1 {
-			break
-		}
-
+	for _, node := range nodes {
 		if _, labelExists := node.Labels["io.cilium.migration/cilium-default"]; (!*rollback && labelExists) || (*rollback && !labelExists) {
 			continue
 		}
@@ -85,7 +84,7 @@ func main() {
 			CheckIfError(err)
 		}
 
-		err = uncordonNode(clientset, node.Name)
+		err = uncordonNode(clientset, &node)
 		CheckIfError(err)
 	}
 
@@ -126,17 +125,195 @@ func handleRollback(clientset *kubernetes.Clientset, node *corev1.Node) error {
 
 	wg.Wait()
 
-	randomName := uuid.New()
+	err = modifyCNIConfig(clientset, node)
+	if err != nil {
+		return err
+	}
+
+	pods, err = clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name),
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, pod := range pods.Items {
+		if strings.HasPrefix(pod.Status.PodIP, IP_PREFIX) && pod.Status.Phase == corev1.PodRunning {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				deleteAndWaitForNewPodCreated(clientset, &pod)
+			}()
+		}
+	}
+	wg.Wait()
+
+	return nil
+}
+
+// isControlPlaneNode checks if a node is a control plane node
+func isControlPlaneNode(node *corev1.Node) bool {
+	if _, ok := node.Labels["node-role.kubernetes.io/controlplane"]; ok {
+		return true
+	}
+
+	if _, ok := node.Labels["node-role.kubernetes.io/master"]; ok {
+		return true
+	}
+
+	if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
+		return true
+	}
+
+	return false
+}
+
+// isEtcdNode checks if a node is an etcd node
+func isEtcdNode(node *corev1.Node) bool {
+	_, ok := node.Labels["node-role.kubernetes.io/etcd"]
+	return ok
+}
+
+// isWorkerNode checks if a node is a worker node
+func isWorkerNode(node *corev1.Node) bool {
+	_, ok := node.Labels["node-role.kubernetes.io/worker"]
+	return ok
+}
+
+func drainNode(node *corev1.Node) error {
+	// leverage drain command instead of reinventing the wheel by using eviction api
+	cmd := exec.Command("kubectl", "drain", "--ignore-daemonsets", "--delete-emptydir-data", "--force", node.Name)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err := cmd.Run()
+
+	return err
+}
+
+func uncordonNode(clientset *kubernetes.Clientset, node *corev1.Node) error {
+	nodesClient := clientset.CoreV1().Nodes()
+
+	patchData := []map[string]interface{}{
+		{
+			"op":    "replace",
+			"path":  "/spec/unschedulable",
+			"value": false,
+		},
+	}
+	patchBytes, err := json.Marshal(patchData)
+	if err != nil {
+		return err
+	}
+
+	_, err = nodesClient.Patch(context.TODO(), node.Name, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("node/%s uncordoned\n", node.Name)
+
+	return nil
+}
+
+// intend to use for pods managed by daemonsets
+func deleteAndWaitForNewPodCreated(clientset *kubernetes.Clientset, pod *corev1.Pod) error {
+	splittedPodNamePrefix := strings.Split(pod.Name, "-")
+	splittedPodNamePrefix = splittedPodNamePrefix[:len(splittedPodNamePrefix)-1]
+	podNamePrefix := strings.Join(splittedPodNamePrefix, "-")
+
+	factory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Second, informers.WithNamespace(pod.Namespace))
+
+	// Create a channel to stop the informer
+	stopCh := make(chan struct{})
+	var stopped bool
+
+	informer := factory.Core().V1().Pods().Informer()
+	// Add event handlers to the informer
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			newPod := newObj.(*corev1.Pod)
+
+			newSplittedPodNamePrefix := strings.Split(newPod.Name, "-")
+			newSplittedPodNamePrefix = newSplittedPodNamePrefix[:len(newSplittedPodNamePrefix)-1]
+			newPodNamePrefix := strings.Join(newSplittedPodNamePrefix, "-")
+
+			if newPodNamePrefix == podNamePrefix &&
+				newPod.Name != pod.Name &&
+				newPod.Spec.NodeName == pod.Spec.NodeName &&
+				newPod.Status.Phase == corev1.PodRunning {
+
+				if !stopped {
+					stopped = true
+					close(stopCh)
+					fmt.Printf("pod/%s created\n", pod.Name)
+				}
+			}
+		},
+	})
+
+	// Start the informer
+	factory.Start(stopCh)
+	// Wait for the cache to sync
+	if !cache.WaitForCacheSync(stopCh, informer.HasSynced) {
+		return errors.New("Failed to sync caches")
+	}
+
+	err := clientset.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("pod/%s deleted\n", pod.Name)
+
+	// Run the informer
+	<-stopCh
+
+	return nil
+}
+
+func modifyCNIConfig(clientset *kubernetes.Clientset, node *corev1.Node) error {
+	randomName := fmt.Sprintf("cni-config-modifier-%s", uuid.New())
+	factory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Second, informers.WithNamespace("kube-system"))
+
+	// Create a channel to stop the informer
+	stopCh := make(chan struct{})
+	var stopped bool
+
+	informer := factory.Core().V1().Pods().Informer()
+	// Add event handlers to the informer
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			newPod := newObj.(*corev1.Pod)
+
+			if newPod.Name == randomName &&
+				newPod.Status.Phase == corev1.PodSucceeded {
+
+				if !stopped {
+					stopped = true
+					close(stopCh)
+					fmt.Printf("pod/%s completed\n", randomName)
+				}
+			}
+		},
+	})
+
+	// Start the informer
+	factory.Start(stopCh)
+	// Wait for the cache to sync
+	if !cache.WaitForCacheSync(stopCh, informer.HasSynced) {
+		return errors.New("Failed to sync caches")
+	}
 
 	// Define the pod spec with hostPath volume and container
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("pod-%s", randomName),
+			Name: randomName,
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{
-					Name:  fmt.Sprintf("container-%s", randomName),
+					Name:  randomName,
 					Image: "busybox",
 					Command: []string{
 						"sh", "-c",
@@ -175,110 +352,11 @@ func handleRollback(clientset *kubernetes.Clientset, node *corev1.Node) error {
 	}
 
 	// Create the pod
-	_, err = clientset.CoreV1().Pods("kube-system").Create(context.TODO(), pod, metav1.CreateOptions{})
-	CheckIfError(err)
-
-	return nil
-}
-
-// isControlPlaneNode checks if a node is a control plane node
-func isControlPlaneNode(node *corev1.Node) bool {
-	if _, ok := node.Labels["node-role.kubernetes.io/controlplane"]; ok {
-		return true
-	}
-
-	if _, ok := node.Labels["node-role.kubernetes.io/master"]; ok {
-		return true
-	}
-
-	if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
-		return true
-	}
-
-	return false
-}
-
-// isEtcdNode checks if a node is an etcd node
-func isEtcdNode(node *corev1.Node) bool {
-	_, ok := node.Labels["node-role.kubernetes.io/etcd"]
-	return ok
-}
-
-// isWorkerNode checks if a node is a worker node
-func isWorkerNode(node *corev1.Node) bool {
-	_, ok := node.Labels["node-role.kubernetes.io/worker"]
-	return ok
-}
-
-func drainNode(node *corev1.Node) error {
-	cmd := exec.Command("kubectl", "drain", "--ignore-daemonsets", "--delete-emptydir-data", "--force", node.Name)
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	err := cmd.Run()
-
-	return err
-}
-
-func uncordonNode(clientset *kubernetes.Clientset, nodeName string) error {
-	nodesClient := clientset.CoreV1().Nodes()
-
-	patchData := []map[string]interface{}{
-		{
-			"op":    "replace",
-			"path":  "/spec/unschedulable",
-			"value": false,
-		},
-	}
-	patchBytes, err := json.Marshal(patchData)
+	_, err := clientset.CoreV1().Pods("kube-system").Create(context.TODO(), pod, metav1.CreateOptions{})
 	if err != nil {
 		return err
 	}
-
-	_, err = nodesClient.Patch(context.TODO(), nodeName, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("node/%s uncordoned\n", nodeName)
-
-	return nil
-}
-
-// intend to use for pods managed by daemonsets
-func deleteAndWaitForNewPodCreated(clientset *kubernetes.Clientset, pod *corev1.Pod) error {
-	factory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Second, informers.WithNamespace(pod.Namespace))
-
-	// Create a channel to stop the informer
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-
-	informer := factory.Core().V1().Pods().Informer()
-	// Add event handlers to the informer
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			newPod := newObj.(*corev1.Pod)
-
-			if newPod.Labels["k8s-app"] == pod.Labels["k8s-app"] && newPod.Name != pod.Name && newPod.Spec.NodeName == pod.Spec.NodeName && newPod.Status.Phase == corev1.PodRunning {
-				stopCh <- struct{}{}
-				fmt.Printf("New pod \"%s\" is created\n", newPod.Name)
-			}
-		},
-	})
-
-	// Start the informer
-	factory.Start(stopCh)
-	// Wait for the cache to sync
-	if !cache.WaitForCacheSync(stopCh, informer.HasSynced) {
-		return errors.New("Failed to sync caches")
-	}
-
-	err := clientset.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
-	if err != nil {
-		return err
-	}
-	fmt.Printf("Waiting for pod \"%s\" to be deleted and recreated\n", pod.Name)
+	fmt.Printf("pod/%s created\n", randomName)
 
 	// Run the informer
 	<-stopCh
