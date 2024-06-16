@@ -24,7 +24,8 @@ import (
 	"k8s.io/client-go/util/homedir"
 )
 
-const IP_PREFIX = "10.123."
+const CILIUM_IP_PREFIX = "10.123."
+const CALICO_IP_PREFIX = "172.22."
 
 func main() {
 	var (
@@ -91,7 +92,53 @@ func main() {
 }
 
 func handleRollout(clientset *kubernetes.Clientset, node *corev1.Node) error {
-	// TODO: handle rollout for a node
+	nodesClient := clientset.CoreV1().Nodes()
+
+	patchData := []byte(`{"metadata":{"labels":{"io.cilium.migration/cilium-default":"true"}}}`)
+
+	_, err := nodesClient.Patch(context.TODO(), node.Name, types.StrategicMergePatchType, patchData, metav1.PatchOptions{})
+	if err != nil {
+		return err
+	}
+
+	pods, err := clientset.CoreV1().Pods("kube-system").List(context.TODO(), metav1.ListOptions{
+		LabelSelector: "k8s-app=cilium",
+		FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name),
+	})
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+
+	for _, pod := range pods.Items {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			deleteAndWaitForNewPodCreated(clientset, &pod)
+		}()
+	}
+
+	wg.Wait()
+
+	pods, err = clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name),
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, pod := range pods.Items {
+		if strings.HasPrefix(pod.Status.PodIP, CALICO_IP_PREFIX) && pod.Status.Phase == corev1.PodRunning {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				deleteAndWaitForNewPodCreated(clientset, &pod)
+			}()
+		}
+	}
+	wg.Wait()
+
 	return nil
 }
 
@@ -138,7 +185,7 @@ func handleRollback(clientset *kubernetes.Clientset, node *corev1.Node) error {
 	}
 
 	for _, pod := range pods.Items {
-		if strings.HasPrefix(pod.Status.PodIP, IP_PREFIX) && pod.Status.Phase == corev1.PodRunning {
+		if strings.HasPrefix(pod.Status.PodIP, CILIUM_IP_PREFIX) && pod.Status.Phase == corev1.PodRunning {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
