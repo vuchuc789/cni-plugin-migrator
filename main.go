@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +24,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 )
+
+// I apologize for not documenting the code properly. It's because I had to write and test this tool in just 2 days.
 
 const CILIUM_IP_PREFIX = "10.123."
 const CALICO_IP_PREFIX = "172.22."
@@ -274,7 +277,7 @@ func deleteAndWaitForNewPodCreated(clientset *kubernetes.Clientset, pod *corev1.
 
 	// Create a channel to stop the informer
 	stopCh := make(chan struct{})
-	var stopped bool
+	var stopped atomic.Bool
 
 	informer := factory.Core().V1().Pods().Informer()
 	// Add event handlers to the informer
@@ -291,8 +294,7 @@ func deleteAndWaitForNewPodCreated(clientset *kubernetes.Clientset, pod *corev1.
 				newPod.Spec.NodeName == pod.Spec.NodeName &&
 				newPod.Status.Phase == corev1.PodRunning {
 
-				if !stopped {
-					stopped = true
+				if stopped.CompareAndSwap(false, true) {
 					close(stopCh)
 					fmt.Printf("pod/%s created\n", pod.Name)
 				}
@@ -325,7 +327,7 @@ func modifyCNIConfig(clientset *kubernetes.Clientset, node *corev1.Node) error {
 
 	// Create a channel to stop the informer
 	stopCh := make(chan struct{})
-	var stopped bool
+	var stopped atomic.Bool
 
 	informer := factory.Core().V1().Pods().Informer()
 	// Add event handlers to the informer
@@ -336,8 +338,7 @@ func modifyCNIConfig(clientset *kubernetes.Clientset, node *corev1.Node) error {
 			if newPod.Name == randomName &&
 				newPod.Status.Phase == corev1.PodSucceeded {
 
-				if !stopped {
-					stopped = true
+				if stopped.CompareAndSwap(false, true) {
 					close(stopCh)
 					fmt.Printf("pod/%s completed\n", randomName)
 				}
