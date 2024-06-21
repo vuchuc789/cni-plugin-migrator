@@ -27,9 +27,6 @@ import (
 
 // I apologize for not documenting the code properly. It's because I had to write and test this tool in just 2 days.
 
-const CILIUM_IP_PREFIX = "10.123."
-const CALICO_IP_PREFIX = "172.22."
-
 func main() {
 	var (
 		kubeconfig                                       *string
@@ -44,6 +41,9 @@ func main() {
 	}
 
 	rollback = flag.Bool("rollback", false, "proceed rollback")
+
+	ciliumIPPrefix := flag.String("cilium-ip-prefix", "", "ip address prefix for cilium pods (ex. 10.123.)")
+	calicoIPPrefix := flag.String("calico-ip-prefix", "", "ip address prefix for calico pods (ex. 172.22.)")
 
 	flag.Parse()
 
@@ -81,10 +81,10 @@ func main() {
 		CheckIfError(err)
 
 		if !*rollback {
-			err = handleRollout(clientset, &node)
+			err = handleRollout(clientset, &node, calicoIPPrefix)
 			CheckIfError(err)
 		} else {
-			err = handleRollback(clientset, &node)
+			err = handleRollback(clientset, &node, ciliumIPPrefix)
 			CheckIfError(err)
 		}
 
@@ -94,7 +94,7 @@ func main() {
 
 }
 
-func handleRollout(clientset *kubernetes.Clientset, node *corev1.Node) error {
+func handleRollout(clientset *kubernetes.Clientset, node *corev1.Node, calicoIPPrefix *string) error {
 	nodesClient := clientset.CoreV1().Nodes()
 
 	patchData := []byte(`{"metadata":{"labels":{"io.cilium.migration/cilium-default":"true"}}}`)
@@ -132,7 +132,7 @@ func handleRollout(clientset *kubernetes.Clientset, node *corev1.Node) error {
 	}
 
 	for _, pod := range pods.Items {
-		if strings.HasPrefix(pod.Status.PodIP, CALICO_IP_PREFIX) && pod.Status.Phase == corev1.PodRunning {
+		if strings.HasPrefix(pod.Status.PodIP, *calicoIPPrefix) && pod.Status.Phase == corev1.PodRunning {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -145,7 +145,7 @@ func handleRollout(clientset *kubernetes.Clientset, node *corev1.Node) error {
 	return nil
 }
 
-func handleRollback(clientset *kubernetes.Clientset, node *corev1.Node) error {
+func handleRollback(clientset *kubernetes.Clientset, node *corev1.Node, ciliumIPPrefix *string) error {
 	nodesClient := clientset.CoreV1().Nodes()
 
 	patchData := []byte(`{"metadata":{"labels":{"io.cilium.migration/cilium-default":null}}}`)
@@ -188,7 +188,7 @@ func handleRollback(clientset *kubernetes.Clientset, node *corev1.Node) error {
 	}
 
 	for _, pod := range pods.Items {
-		if strings.HasPrefix(pod.Status.PodIP, CILIUM_IP_PREFIX) && pod.Status.Phase == corev1.PodRunning {
+		if strings.HasPrefix(pod.Status.PodIP, *ciliumIPPrefix) && pod.Status.Phase == corev1.PodRunning {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
